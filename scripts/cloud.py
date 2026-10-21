@@ -3,6 +3,10 @@
 """Stereo depth and point cloud from the IMX586 cameras on CAM_A and CAM_D."""
 
 import argparse
+import time
+
+import cv2
+import numpy as np
 
 import depthai as dai
 from depthai_nodes.node import ApplyDepthColormap
@@ -12,11 +16,12 @@ CAMERA_SOCKETS = {
     dai.CameraBoardSocket.CAM_A,
     dai.CameraBoardSocket.CAM_D,
 }
-OUTPUT_SIZE = (1280, 720)
+OUTPUT_SIZE = (640, 400)
+NEURAL_MODEL = dai.DeviceModelZoo.NEURAL_DEPTH_576X360
+DEPTH_FPS = 8.0
 COLOR_SIZE = (3840, 2160)
 COLOR_DISPLAY_SIZE = (960, 540)
-POINT_CLOUD_SIZE = (320, 180)
-FPS = 30.0
+FPS = 10.0
 VISUALIZER_PORT = 8082
 
 
@@ -27,7 +32,11 @@ def parseArgs():
         default="10.12.222.68",
         help="PoE device IP address (default: %(default)s)",
     )
-    return parser.parse_args()
+    parser.add_argument("--duration", type=float, help="Stop after this many seconds")
+    args = parser.parse_args()
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be positive")
+    return args
 
 
 def getStereoSockets(calibrationHandler):
@@ -42,20 +51,94 @@ def getStereoSockets(calibrationHandler):
             f"contains {leftSocket.name}/{rightSocket.name}."
         )
 
-    return leftSocket, rightSocket
+    # This robot's physical stereo order is CAM_D (left), CAM_A (right).
+    # EEPROM identifies the calibrated pair but may list it in reverse order.
+    return dai.CameraBoardSocket.CAM_D, dai.CameraBoardSocket.CAM_A
 
 
-def createPointCloud(pipeline, stereo, rightCamera, fps=FPS):
-    # Align depth to a small color output from the same camera. RGBD handles
-    # synchronization and intrinsics while keeping the 3D stream manageable.
-    rgbd = pipeline.create(dai.node.RGBD).build(
-        rightCamera, stereo, size=POINT_CLOUD_SIZE, fps=fps
+def configureNeuralDepth(pipeline, leftOutput, rightOutput):
+    neural = pipeline.create(dai.node.NeuralDepth).build(
+        leftOutput, rightOutput, NEURAL_MODEL
     )
-    # Interpret the raw depth numbers as metres, even though stereo labels
-    # them as millimetres. Do not apply the usual division by 1,000.
-    rgbd.setDepthUnits(dai.LengthUnit.METER)
+    neural.initialConfig.setDepthUnit(dai.LengthUnit.MILLIMETER)
+    # Camera FPS can exceed inference throughput. Drop old pairs before Sync
+    # and bound NN buffering, while keeping left/right inference inputs paired.
+    for input_stream in (neural.left, neural.right):
+        input_stream.setMaxSize(2)
+        input_stream.setBlocking(False)
+    for name in ("left", "right"):
+        neural.neuralNetwork.inputs[name].setMaxSize(1)
+        neural.neuralNetwork.inputs[name].setBlocking(True)
+    print(
+        f"LENS Neural Stereo: camera inputs {OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]}, "
+        f"native inference {neural.getInputSize(NEURAL_MODEL)}", flush=True
+    )
+    return neural
 
-    return rgbd.pcl
+
+class RectifiedRGB(dai.node.HostNode):
+    """Convert the matching rectified image to RGB without another alignment."""
+
+    def build(self, frames):
+        self.link_args(frames)
+        self.sendProcessingToPipeline(True)
+        return self
+
+    def process(self, message):
+        image = message.getCvFrame()
+        image = cv2.cvtColor(
+            image, cv2.COLOR_GRAY2RGB if image.ndim == 2 else cv2.COLOR_BGR2RGB
+        )
+        message.setCvFrame(image, dai.ImgFrame.Type.RGB888i)
+        return message
+
+
+class ValidPointCloud(dai.node.HostNode):
+    """Remove invalid/background points and report metric cloud health."""
+
+    def build(self, clouds):
+        self.link_args(clouds)
+        self.inputs["message"].setMaxSize(1)
+        self.inputs["message"].setBlocking(False)
+        self.sendProcessingToPipeline(True)
+        self.last_report = 0.0
+        self.frames = 0
+        return self
+
+    def process(self, message):
+        points, colors = message.getPointsRGB()
+        valid = np.isfinite(points).all(axis=1)
+        valid &= (points[:, 2] >= 0.2) & (points[:, 2] <= 8.0)
+        self.frames += 1
+        if time.monotonic() - self.last_report >= 5:
+            median = f"{np.median(points[valid, 2]):.2f} m" if valid.any() else "none"
+            age_ms = (dai.Clock.now() - message.getTimestamp()).total_seconds() * 1000
+            print(
+                f"PCL frame {self.frames}: {valid.sum()}/{len(points)} points "
+                f"({valid.mean():.1%}), median depth {median}, age {age_ms:.0f} ms",
+                flush=True,
+            )
+            self.last_report = time.monotonic()
+        # Empty frames during camera warmup should not reset the viewer bounds.
+        if not valid.any():
+            return None
+        message.setPointsRGB(
+            np.ascontiguousarray(points[valid]), np.ascontiguousarray(colors[valid])
+        )
+        message.setSize(int(valid.sum()), 1)
+        message.updateBoundingBox()
+        return message
+
+
+def createPointCloud(pipeline, stereo):
+    # NeuralDepth outputs depth in the rectified LEFT camera pixel grid.
+    # Feed that same image to RGBD without same-camera ImageAlign.
+    color = pipeline.create(RectifiedRGB).build(stereo.rectifiedLeft)
+    rgbd = pipeline.create(dai.node.RGBD).build()
+    color.out.link(rgbd.inColor)
+    stereo.depth.link(rgbd.inDepth)
+    rgbd.setDepthUnits(dai.LengthUnit.MILLIMETER)  # Input mm -> output metres.
+    return pipeline.create(ValidPointCloud).build(rgbd.pcl).out
 
 
 def main():
@@ -75,18 +158,17 @@ def main():
         rightFocus = calibrationHandler.getLensPosition(rightSocket)
         leftCamera.initialControl.setManualFocus(leftFocus)
         rightCamera.initialControl.setManualFocus(rightFocus)
-        """print(
+        print(
             "Using calibrated focus positions: "
             f"{leftSocket.name}={leftFocus}, {rightSocket.name}={rightFocus}"
-        )"""
+        )
 
-        # StereoDepth accepts inputs up to 1280 pixels wide. requestOutput makes
-        # each 8000x6000 IMX586 use a downscaled 1280x720 ISP output.
+        # NeuralDepth rectifies and resizes these 640x400 inputs for LENS.
         leftOutput = leftCamera.requestOutput(
-            OUTPUT_SIZE, fps=FPS, enableUndistortion=False
+            OUTPUT_SIZE, type=dai.ImgFrame.Type.BGR888i, fps=DEPTH_FPS, enableUndistortion=False
         )
         rightOutput = rightCamera.requestOutput(
-            OUTPUT_SIZE, fps=FPS, enableUndistortion=False
+            OUTPUT_SIZE, type=dai.ImgFrame.Type.BGR888i, fps=DEPTH_FPS, enableUndistortion=False
         )
         leftColorOutput = leftCamera.requestOutput(
             COLOR_SIZE, fps=FPS, enableUndistortion=False
@@ -112,21 +194,15 @@ def main():
             )
             colorOutput.link(preview.inputImage)
 
-        stereo = pipeline.create(dai.node.StereoDepth)
-        stereo.setRectification(True)
-        stereo.setSubpixel(True)
-        stereo.setDepthAlign(rightSocket)
-
-        leftOutput.link(stereo.left)
-        rightOutput.link(stereo.right)
+        stereo = configureNeuralDepth(pipeline, leftOutput, rightOutput)
 
         depthColor = pipeline.create(ApplyDepthColormap).build(stereo.depth)
         # Process Python callbacks in the main loop so they finish before
         # shutdown closes their output queues.
         depthColor.sendProcessingToPipeline(True)
-        pointCloud = createPointCloud(pipeline, stereo, rightCamera)
+        pointCloud = createPointCloud(pipeline, stereo)
 
-        visualizer.addTopic("Depth (metres)", depthColor.out, group="Stereo")
+        visualizer.addTopic("Depth (millimetres)", depthColor.out, group="Stereo")
         visualizer.addTopic("Point cloud (metres)", pointCloud, group="Point cloud")
         visualizer.addTopic(
             "Rectified left", stereo.rectifiedLeft, group="Stereo"
@@ -149,10 +225,13 @@ def main():
         print(
             f"Open http://localhost:{VISUALIZER_PORT} in Chrome to view the streams."
         )
-        print("Depth and point-cloud values are interpreted as metres without rescaling.")
+        print("Neural point cloud: metres, 0.2–8 m range, native 576x360 depth.")
+        started = time.monotonic()
         try:
             while pipeline.isRunning():
                 pipeline.processTasks()
+                if args.duration is not None and time.monotonic() - started >= args.duration:
+                    break
                 if visualizer.waitKey(1) == ord("q"):
                     break
         except KeyboardInterrupt:

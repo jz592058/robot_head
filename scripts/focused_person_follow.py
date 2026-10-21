@@ -15,7 +15,13 @@ from depthai_nodes.node import (
 )
 from dotenv import load_dotenv
 
-from cloud import OUTPUT_SIZE as STEREO_SIZE, createPointCloud, getStereoSockets
+from cloud import (
+    DEPTH_FPS,
+    OUTPUT_SIZE as STEREO_SIZE,
+    configureNeuralDepth,
+    createPointCloud,
+    getStereoSockets,
+)
 from person_follow import (
     DEFAULT_PORT,
     connect_to_arm,
@@ -97,18 +103,22 @@ class FacesFromCollection(dai.node.HostNode):
         return empty
 
 
-class RotatePointCloud180(dai.node.HostNode):
-    """Correct the upside-down camera mounting after stereo reconstruction."""
+class PointCloudForViewer(dai.node.HostNode):
+    """Map the upside-down sensor's optical coordinates to the Y-up viewer."""
 
     def build(self, point_cloud):
         self.link_args(point_cloud)
+        self.inputs["message"].setMaxSize(1)
+        self.inputs["message"].setBlocking(False)
         self.sendProcessingToPipeline(True)
         return self
 
     def process(self, message):
         points, colors = message.getPointsRGB()
-        # Rotate around the viewing axis: preserve depth and point colors.
-        points[:, :2] *= -1
+        # The inverted sensor already gives physically upper points positive Y,
+        # which is also up in the 3D viewer. Flipping Y would turn them upside down.
+        # Keep the horizontal mounting correction; preserve Z and point colors.
+        points[:, 0] *= -1
         message.setPointsRGB(points, colors)
         message.updateBoundingBox()
         return message
@@ -232,20 +242,19 @@ def build_point_cloud(pipeline, calibration, fps):
         camera.initialControl.setManualFocus(calibration.getLensPosition(socket))
         cameras[socket] = camera
 
-    stereo = pipeline.create(dai.node.StereoDepth)
-    stereo.setRectification(True)
-    stereo.setSubpixel(True)
-    stereo.setDepthAlign(right_socket)
     # Keep stereo inputs unrotated so they match the calibration. Tracking
     # applies its 180-degree rotation only to its own outputs from CAM_D.
-    cameras[left_socket].requestOutput(
-        STEREO_SIZE, fps=fps, enableUndistortion=False
-    ).link(stereo.left)
-    cameras[right_socket].requestOutput(
-        STEREO_SIZE, fps=fps, enableUndistortion=False
-    ).link(stereo.right)
-    point_cloud = createPointCloud(pipeline, stereo, cameras[right_socket], fps=fps)
-    upright_cloud = pipeline.create(RotatePointCloud180).build(point_cloud)
+    left_output = cameras[left_socket].requestOutput(
+        STEREO_SIZE, type=dai.ImgFrame.Type.BGR888i,
+        fps=min(fps, DEPTH_FPS), enableUndistortion=False
+    )
+    right_output = cameras[right_socket].requestOutput(
+        STEREO_SIZE, type=dai.ImgFrame.Type.BGR888i,
+        fps=min(fps, DEPTH_FPS), enableUndistortion=False
+    )
+    stereo = configureNeuralDepth(pipeline, left_output, right_output)
+    point_cloud = createPointCloud(pipeline, stereo)
+    upright_cloud = pipeline.create(PointCloudForViewer).build(point_cloud)
     return cameras[dai.CameraBoardSocket.CAM_D], upright_cloud.out
 
 
@@ -260,9 +269,8 @@ def build_tracker(pipeline, fps, camera):
         ),
         HIGH_RES_SIZE,
     )
-    # RVC4 allows only three outputs per sensor: stereo, RGBD color, and this
-    # high-res crop. Resize the rotated crop for detection instead of asking
-    # CAM_D for a fourth output. Both tracking branches keep the same view.
+    # Share one high-res crop between both tracking branches. The point cloud
+    # uses rectified stereo images and needs no additional sensor output.
     preview = pipeline.create(dai.node.ImageManip)
     preview.initialConfig.setOutputSize(
         *LOW_RES_SIZE, dai.ImageManipConfig.ResizeMode.STRETCH
